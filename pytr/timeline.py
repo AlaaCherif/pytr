@@ -197,5 +197,5 @@ class Timeline:
                 )
 
                 dl.work_responses()
-        except error:
-            print(error)
+        except :
+            print("Key Error I Guess")
