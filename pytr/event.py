@@ -1,270 +1,211 @@
-from babel.numbers import parse_decimal, NumberFormatError
-from dataclasses import dataclass
 from datetime import datetime
-from enum import auto, Enum
-import re
-from typing import Any, Dict, Optional, Tuple, Union
+import json
+
+from .utils import get_logger
+from .transactions import export_transactions
 
 
-class ConditionalEventType(Enum):
-    """Events that conditionally map to None or one/multiple PPEventType events"""
+class Timeline:
+    def __init__(self, tr, max_age_timestamp):
+        self.tr = tr
+        self.log = get_logger(__name__)
+        self.received_detail = 0
+        self.requested_detail = 0
+        self.events_without_docs = []
+        self.events_with_docs = []
+        self.num_timelines = 0
+        self.timeline_events = {}
+        self.max_age_timestamp = max_age_timestamp
 
-    SAVEBACK = auto()
-    TRADE_INVOICE = auto()
-
-
-class PPEventType(Enum):
-    """PP Event Types"""
-
-    BUY = "BUY"
-    DEPOSIT = "DEPOSIT"
-    DIVIDEND = "DIVIDEND"
-    FEES = "FEES"  # Currently not mapped to
-    FEES_REFUND = "FEES_REFUND"  # Currently not mapped to
-    INTEREST = "INTEREST"
-    INTEREST_CHARGE = "INTEREST_CHARGE"  # Currently not mapped to
-    REMOVAL = "REMOVAL"
-    SELL = "SELL"
-    TAXES = "TAXES"  # Currently not mapped to
-    TAX_REFUND = "TAX_REFUND"
-    TRANSFER_IN = "TRANSFER_IN"  # Currently not mapped to
-    TRANSFER_OUT = "TRANSFER_OUT"  # Currently not mapped to
-
-
-class EventType(Enum):
-    PP_EVENT_TYPE = PPEventType
-    CONDITIONAL_EVENT_TYPE = ConditionalEventType
-
-
-tr_event_type_mapping = {
-    # Deposits
-    "INCOMING_TRANSFER": PPEventType.DEPOSIT,
-    "INCOMING_TRANSFER_DELEGATION": PPEventType.DEPOSIT,
-    "PAYMENT_INBOUND": PPEventType.DEPOSIT,
-    "PAYMENT_INBOUND_GOOGLE_PAY": PPEventType.DEPOSIT,
-    "PAYMENT_INBOUND_SEPA_DIRECT_DEBIT": PPEventType.DEPOSIT,
-    "card_refund": PPEventType.DEPOSIT,
-    "card_successful_oct": PPEventType.DEPOSIT,
-    # Dividends
-    "CREDIT": PPEventType.DIVIDEND,
-    "ssp_corporate_action_invoice_cash": PPEventType.DIVIDEND,
-    # Failed card transactions
-    "card_failed_transaction": PPEventType.REMOVAL,
-    # Interests
-    "INTEREST_PAYOUT": PPEventType.INTEREST,
-    "INTEREST_PAYOUT_CREATED": PPEventType.INTEREST,
-    # Removals
-    "OUTGOING_TRANSFER": PPEventType.REMOVAL,
-    "OUTGOING_TRANSFER_DELEGATION": PPEventType.REMOVAL,
-    "PAYMENT_OUTBOUND": PPEventType.REMOVAL,
-    "card_order_billed": PPEventType.REMOVAL,
-    "card_successful_atm_withdrawal": PPEventType.REMOVAL,
-    "card_successful_transaction": PPEventType.REMOVAL,
-    # Saveback
-    "benefits_saveback_execution": ConditionalEventType.SAVEBACK,
-    # Tax refunds
-    "TAX_REFUND": PPEventType.TAX_REFUND,
-    "ssp_tax_correction_invoice": PPEventType.TAX_REFUND,
-    # Trade invoices
-    "ORDER_EXECUTED": ConditionalEventType.TRADE_INVOICE,
-    "SAVINGS_PLAN_EXECUTED": ConditionalEventType.TRADE_INVOICE,
-    "SAVINGS_PLAN_INVOICE_CREATED": ConditionalEventType.TRADE_INVOICE,
-    "benefits_spare_change_execution": ConditionalEventType.TRADE_INVOICE,
-    "TRADE_INVOICE": ConditionalEventType.TRADE_INVOICE,
-}
-
-
-@dataclass
-class Event:
-    date: datetime
-    title: str
-    event_type: Optional[EventType]
-    fees: Optional[float]
-    isin: Optional[str]
-    note: Optional[str]
-    shares: Optional[float]
-    taxes: Optional[float]
-    value: Optional[float]
-
-    @classmethod
-    def from_dict(cls, event_dict: Dict[Any, Any]):
-        """Deserializes the event dictionary into an Event object
-
-        Args:
-            event_dict (json): _description_
-
-        Returns:
-            Event: Event object
+    async def get_next_timeline_transactions(self, response=None):
         """
-        date: datetime = datetime.fromisoformat(event_dict["timestamp"][:19])
-        event_type: Optional[EventType] = cls._parse_type(event_dict)
-        title: str = event_dict["title"]
-        value: Optional[float] = (
-            v
-            if (v := event_dict.get("amount", {}).get("value", None)) is not None
-            and v != 0.0
-            else None
-        )
-        fees, isin, note, shares, taxes = cls._parse_type_dependent_params(
-            event_type, event_dict
-        )
-        return cls(date, title, event_type, fees, isin, note, shares, taxes, value)
+        Get timelines transactions and save time in list timelines.
+        Extract timeline transactions events and save them in list timeline_events
 
-    @staticmethod
-    def _parse_type(event_dict: Dict[Any, Any]) -> Optional[EventType]:
-        event_type: Optional[EventType] = tr_event_type_mapping.get(
-            event_dict.get("eventType", ""), None
-        )
-        if event_dict.get("status", "").lower() == "canceled":
-            event_type = None
-        return event_type
-
-    @classmethod
-    def _parse_type_dependent_params(
-        cls, event_type: EventType, event_dict: Dict[Any, Any]
-    ) -> Tuple[Optional[Union[str, float]]]:
-        """Parses the fees, isin, note, shares and taxes fields
-
-        Args:
-            event_type (EventType): _description_
-            event_dict (Dict[Any, Any]): _description_
-
-        Returns:
-            Tuple[Optional[Union[str, float]]]]: fees, isin, note, shares, taxes
         """
-        isin, shares, taxes, note, fees = (None,) * 5
-
-        if event_type is PPEventType.DIVIDEND:
-            isin = cls._parse_isin(event_dict)
-            taxes = cls._parse_taxes(event_dict)
-
-        elif isinstance(event_type, ConditionalEventType):
-            isin = cls._parse_isin(event_dict)
-            shares, fees = cls._parse_shares_and_fees(event_dict)
-            taxes = cls._parse_taxes(event_dict)
-
-        elif event_type is PPEventType.INTEREST:
-            taxes = cls._parse_taxes(event_dict)
-
-        elif event_type in [PPEventType.DEPOSIT, PPEventType.REMOVAL]:
-            note = cls._parse_card_note(event_dict)
-
-        return fees, isin, note, shares, taxes
-
-    @staticmethod
-    def _parse_isin(event_dict: Dict[Any, Any]) -> str:
-        """Parses the isin
-
-        Args:
-            event_dict (Dict[Any, Any]): _description_
-
-        Returns:
-            str: isin
-        """
-        sections = event_dict.get("details", {}).get("sections", [{}])
-        isin = event_dict.get("icon", "")
-        isin = isin[isin.find("/") + 1 :]
-        isin = isin[: isin.find("/")]
-        isin2 = isin
-        for section in sections:
-            action = section.get("action", None)
-            if action and action.get("type", {}) == "instrumentDetail":
-                isin2 = section.get("action", {}).get("payload")
-                break
-        if isin != isin2:
-            isin = isin2
-        return isin
-
-    @classmethod
-    def _parse_shares_and_fees(
-        cls, event_dict: Dict[Any, Any]
-    ) -> Tuple[Optional[float]]:
-        """Parses the amount of shares and the applicable fees
-
-        Args:
-            event_dict (Dict[Any, Any]): _description_
-
-        Returns:
-            Tuple[Optional[float]]: shares, fees
-        """
-        return_vals = {}
-        sections = event_dict.get("details", {}).get("sections", [{}])
-        for section in sections:
-            if section.get("title") == "Transaktion":
-                data = section["data"]
-                shares_dicts = list(
-                    filter(lambda x: x["title"] in ["Aktien", "Anteile"], data)
-                )
-                fees_dicts = list(filter(lambda x: x["title"] == "Gebühr", data))
-                titles = ["shares"] * len(shares_dicts) + ["fees"] * len(fees_dicts)
-                locales = [
-                    "en" if e["title"] == "Aktien" else "de"
-                    for e in shares_dicts + fees_dicts
-                ]
-                for key, elem_dict, locale in zip(
-                    titles, shares_dicts + fees_dicts, locales
+        if response is None:
+            # empty response / first timeline
+            self.log.info("Subscribing to #1 timeline transactions")
+            self.num_timelines = 0
+            await self.tr.timeline_transactions()
+        else:
+            self.num_timelines += 1
+            added_last_event = True
+            for event in response["items"]:
+                if (
+                    self.max_age_timestamp == 0
+                    or datetime.fromisoformat(event["timestamp"][:19]).timestamp()
+                    >= self.max_age_timestamp
                 ):
-                    return_vals[key] = cls._parse_float_from_detail(elem_dict, locale)
-        return return_vals.get("shares"), return_vals.get("fees")
+                    event["source"] = "timelineTransaction"
+                    self.timeline_events[event["id"]] = event
+                else:
+                    added_last_event = False
+                    break
 
-    @classmethod
-    def _parse_taxes(cls, event_dict: Dict[Any, Any]) -> Optional[float]:
-        """Parses the levied taxes
+            self.log.info(
+                f"Received #{self.num_timelines:<2} timeline transactions")
+            after = response["cursors"].get("after")
+            if (after is not None) and added_last_event:
+                self.log.info(
+                    f"Subscribing #{self.num_timelines +
+                                    1:<2} timeline transactions"
+                )
+                await self.tr.timeline_transactions(after)
+            else:
+                # last timeline is reached
+                self.log.info("Received last relevant timeline transaction")
+                await self.get_next_timeline_activity_log()
 
-        Args:
-            event_dict (Dict[Any, Any]): _description_
-
-        Returns:
-            Optional[float]: taxes
+    async def get_next_timeline_activity_log(self, response=None):
         """
-        # taxes keywords
-        taxes_keys = {"Steuer", "Steuern"}
-        # Gather all section dicts
-        sections = event_dict.get("details", {}).get("sections", [{}])
-        # Gather all dicts pertaining to transactions
-        transaction_dicts = filter(
-            lambda x: x["title"] in {"Transaktion", "Geschäft"}, sections
-        )
-        for transaction_dict in transaction_dicts:
-            # Filter for taxes dicts
-            data = transaction_dict.get("data", [{}])
-            taxes_dicts = filter(lambda x: x["title"] in taxes_keys, data)
-            # Iterate over dicts containing tax information and parse each one
-            for taxes_dict in taxes_dicts:
-                parsed_taxes_val = cls._parse_float_from_detail(taxes_dict, "de")
-                if parsed_taxes_val is not None:
-                    return parsed_taxes_val
+        Get timelines acvtivity log and save time in list timelines.
+        Extract timeline acvtivity log events and save them in list timeline_events
 
-    @staticmethod
-    def _parse_card_note(event_dict: Dict[Any, Any]) -> Optional[str]:
-        """Parses the note associated with card transactions
-
-        Args:
-            event_dict (Dict[Any, Any]): _description_
-
-        Returns:
-            Optional[str]: note
         """
-        if event_dict.get("eventType", "").startswith("card_"):
-            return event_dict["eventType"]
+        if response is None:
+            # empty response / first timeline
+            self.log.info("Awaiting #1  timeline activity log")
+            self.num_timelines = 0
+            await self.tr.timeline_activity_log()
+        else:
+            self.num_timelines += 1
+            added_last_event = False
+            for event in response["items"]:
+                if (
+                    self.max_age_timestamp == 0
+                    or datetime.fromisoformat(event["timestamp"][:19]).timestamp()
+                    >= self.max_age_timestamp
+                ):
+                    if event["id"] in self.timeline_events:
+                        self.log.warning(
+                            f"Received duplicate event {event['id']}")
+                    else:
+                        added_last_event = True
+                    event["source"] = "timelineActivity"
+                    self.timeline_events[event["id"]] = event
+                else:
+                    break
 
-    @staticmethod
-    def _parse_float_from_detail(
-        elem_dict: Dict[str, Any], locale: str
-    ) -> Optional[float]:
-        """Parses a "detail" dictionary potentially containing a float in a certain locale format
+            self.log.info(
+                f"Received #{self.num_timelines:<2} timeline activity log")
+            after = response["cursors"].get("after")
+            if (after is not None) and added_last_event:
+                self.log.info(
+                    f"Subscribing #{self.num_timelines +
+                                    1:<2} timeline activity log"
+                )
+                await self.tr.timeline_activity_log(after)
+            else:
+                self.log.info("Received last relevant timeline activity log")
+                await self._get_timeline_details()
 
-        Args:
-            str (Dict[str, Any]): _description_
-            locale (str): _description_
-
-        Returns:
-            Optional[float]: parsed float value or None
+    async def _get_timeline_details(self):
         """
-        unparsed_val = elem_dict.get("detail", {}).get("text", "")
-        parsed_val = re.sub(r"[^\,\.\d-]", "", unparsed_val)
+        request timeline details
+        """
+        for event in self.timeline_events.values():
+            action = event.get("action")
+            msg = ""
+            if action is None:
+                if event.get("actionLabel") is None:
+                    msg += "Skip: no action"
+            elif action.get("type") != "timelineDetail":
+                msg += f"Skip: action type unmatched ({action['type']})"
+            elif action.get("payload") != event["id"]:
+                msg += f"Skip: payload unmatched ({action['payload']})"
+
+            if msg != "":
+                self.events_without_docs.append(event)
+                self.log.debug(f"{msg} {event['title']}: {event.get('body')} ")
+            else:
+                self.requested_detail += 1
+                await self.tr.timeline_detail_v2(event["id"])
+        self.log.info("All timeline details requested")
+        return False
+
+    async def process_timelineDetail(self, response, dl):
+        """
+        process timeline details response
+        download any associated docs
+        create other_events.json, events_with_documents.json and account_transactions.csv
+        """
+
         try:
-            parsed_val = float(parse_decimal(parsed_val, locale))
-        except NumberFormatError as e:
-            return None
-        return None if parsed_val == 0.0 else parsed_val
+            self.received_detail += 1
+            event = self.timeline_events[response["id"]]
+            event["details"] = response
+
+            max_details_digits = len(str(self.requested_detail))
+            self.log.info(
+                f"{self.received_detail:>{max_details_digits}
+                   }/{self.requested_detail}: "
+                + f"{event['title']} -- {event['subtitle']
+                                         } - {event['timestamp'][:19]}"
+            )
+
+            subfolder = {
+                "benefits_saveback_execution": "Saveback",
+                "benefits_spare_change_execution": "RoundUp",
+                "ssp_corporate_action_invoice_cash": "Dividende",
+                "CREDIT": "Dividende",
+                "INTEREST_PAYOUT_CREATED": "Zinsen",
+                "SAVINGS_PLAN_EXECUTED": "Sparplan",
+            }.get(event["eventType"])
+
+            event["has_docs"] = False
+            for section in response["sections"]:
+                if section["type"] != "documents":
+                    continue
+                for doc in section["data"]:
+                    event["has_docs"] = True
+                    try:
+                        timestamp = datetime.strptime(
+                            doc["detail"], "%d.%m.%Y").timestamp()
+                    except (ValueError, KeyError):
+                        timestamp = datetime.now().timestamp()
+                    if self.max_age_timestamp == 0 or self.max_age_timestamp < timestamp:
+                        title = f"{doc['title']} - {event['title']}"
+                        if event["eventType"] in [
+                            "ACCOUNT_TRANSFER_INCOMING",
+                            "ACCOUNT_TRANSFER_OUTGOING",
+                            "CREDIT",
+                        ]:
+                            title += f" - {event['subtitle']}"
+                        dl.dl_doc(doc, title, doc.get("detail"), subfolder)
+
+            if event["has_docs"]:
+                self.events_with_docs.append(event)
+            else:
+                self.events_without_docs.append(event)
+
+            if self.received_detail == self.requested_detail:
+                self.log.info("Received all details")
+                dl.output_path.mkdir(parents=True, exist_ok=True)
+                with open(dl.output_path / "other_events.json", "w", encoding="utf-8") as f:
+                    json.dump(self.events_without_docs, f,
+                              ensure_ascii=False, indent=2)
+
+                with open(
+                    dl.output_path / "events_with_documents.json", "w", encoding="utf-8"
+                ) as f:
+                    json.dump(self.events_with_docs, f,
+                              ensure_ascii=False, indent=2)
+
+                with open(dl.output_path / "all_events.json", "w", encoding="utf-8") as f:
+                    json.dump(
+                        self.events_without_docs + self.events_with_docs,
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+
+                export_transactions(
+                    dl.output_path / "all_events.json",
+                    dl.output_path / "account_transactions.csv",
+                    sort=dl.sort_export,
+                )
+
+                dl.work_responses()
+        except error:
+            print(error)
